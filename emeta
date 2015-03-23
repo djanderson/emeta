@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+#
+#  Name:     emeta
+#  Version:  1.0.1
+#  Requires: GNU sed, gawk, portageq, ncurses tput, a portage tree
+#  Author:   Douglas Anderson (djanderson)
+#  License:  GPL v3
+#
+#  Parse an ebuild's metadata file for useful information on systems using
+#+ Gentoo's Portage package manager (or equivilent) and Portage tree.
+#
+#  CHANGELOG
+#
+#  1.0.1 - Made some comments more clear and cleaned up some code cosmetically
+
+shopt -s extglob
+
+##########
+# Define usage function and catch -h and --help
+##########
+
+usage () {
+        cat <<- EOF
+        Parse an ebuild's metadata file for useful information.
+        Usage: ${0##*/} [options] [category/]package
+
+        Examples:
+         ${0##*/} dev-db/mysql  Format and display mysql's metadata.xml file
+         ${0##*/} -H -m asdf    Display asdf's herd and maintainer (blank if none)
+         ${0##*/} -d emacs vim  Show where emacs and vim live in the Portage tree
+
+         -d,  --directory     Return the directory which contains ebuild files
+         -h,  --help          Display this help message
+         -H,  --herd          Return the herd responsible for the ebuild
+         -l,  --long-desc     Display extended package description
+         -m,  --maintainer    Return the maintainer responsible for the ebuild
+         -nc, --no-color      No color output
+         -r,  --raw-metadata  Display the raw metadata.xml file
+         -u,  --use-flags     Return per-package USE flag descriptions
+
+        Note:
+         Some ebuild metadata files are more complete than others.
+         Use \`${0##*/} package' (without options) to print everything available.
+
+        EOF
+        exit 0
+}
+
+short_usage () {
+        echo "Usage: ${0##*/} [options] [category/]package"
+        echo
+        echo "Type ${0##*/} --help for more information"
+}
+
+##########
+# Read input and store it in $called_options; do some input error handling
+##########
+
+called_options=""
+
+while [[ $1 ]]; do
+        case "$1" in
+                -h  | --help )
+                        usage
+                        exit 0
+                        ;;
+                -d  | --directory )
+                        called_options="$called_options --directory"
+                        ;;
+                -H  | --herd )
+                        called_options="$called_options --herd"
+                        ;;
+                -l  | --long-desc )
+                        called_options="$called_options --long-desc"
+                        ;;
+                -m  | --maintainer )
+                        called_options="$called_options --maintainer"
+                        ;;
+                -nc | --no-color )
+                        nocolor="true"
+                        ;;
+                -r  | --raw-metadata )
+                        called_options="$called_options --raw-metadata"
+                        ;;
+                -u  | --use-flags )
+                        called_options="$called_options --use-flags"
+                        ;;
+                -   | -* )
+                        echo "${0##*/}: Option \""$1"\" is invalid." 1>&2
+                        short_usage
+                        exit 1
+                        ;;
+                * )
+                        package_array=(${package_array[@]} $1)
+                        ;;
+        esac
+        shift
+done
+
+if [[ ! $package_array ]]; then
+        echo "${0##*/}: You didn't specify a package name." 1>&2
+        short_usage
+        exit 1
+fi
+
+##########
+# Set global variables
+##########
+
+#  Set colors
+[[ ! $nocolor ]] && nocolor=$(portageq envvar NOCOLOR 2>/dev/null)
+if [[ $nocolor = true || $nocolor = yes ]]
+then
+        nocolor=true
+        NO=""
+        BR=""
+        CY=""
+        GR=""
+        RD=""
+        YL=""
+        BL=""
+else
+        nocolor=false
+        NO="\x1b[0m"      #  e-tool NORMAL
+        BR="\x1b[0;01m"
+        CY="\x1b[36;01m"  #  e-tool HILITE
+        GR="\x1b[32;01m"  #  e-tool GOOD
+        RD="\x1b[31;01m"  #  e-tool BAD
+        YL="\x1b[33;01m"  #  e-tool WARN
+        BL="\x1b[34;01m"  #  e-tool BRACKET
+fi
+
+#  Set Portage directory
+portage_dir=$(portageq portdir 2>/dev/null)
+[[ ! -d $portage_dir ]] && portage_dir="/usr/portage"
+
+for (( i = 0 ; i < ${#package_array[@]} ; i++ )); do
+        package=${package_array[$i]}
+
+        #  Find the directory with metadata.xml
+        if [[ ! $package == */* ]]; then
+                package_dir=(${package_dir[@]} ${portage_dir}/*-*/${package})
+                if [[ ! -d ${package_dir[$i]} ]]; then
+                        #  Directory doesn't exist, let's check if it's a virtual package
+                        package_dir[$i]=""
+                        package_dir=(${package_dir[@]} ${portage_dir}/virtual/${package})
+                        if [[ ! -d ${package_dir[$i]} ]]; then
+                                echo "${0##*/}: \"${package}\" does not appear to be a proper package name." 1>&2
+                                short_usage
+                                exit 1
+                        fi
+                fi
+        else
+                package_dir=(${package_dir[@]} ${portage_dir}/${package})
+                if [[ ! -d ${package_dir[$i]} ]]; then
+                        echo "${0##*/}: \"${package}\" does not appear to be a proper ebuild atom." 1>&2
+                        short_usage
+                        exit 1
+                fi
+        fi
+
+        #  Append metadata.xml to package_dir to get metadata.xml's path
+        metadata_location=(${metadata_location[@]} ${package_dir[$i]}/metadata.xml)
+done
+
+##########
+# Define functions
+##########
+
+blockquote() {
+        #  Variables used for formatting by blockquote() and print_blockquoted()
+        padding=12
+        termwidth=$(tput cols 2>/dev/null)
+        blockquote_width=$(( ${termwidth:-80} - padding ))
+
+        #  Takes text to be squeezed as input. Optionally specify width:
+        #+ ex: blockquote "$input" || blockquote $termwidth "$input"
+        if [[ $1 ]]; then
+                if [[ $2 ]]; then
+                        local width="$1"
+                        local input_text="$2"
+                else
+                        local width="$blockquote_width"
+                        local input_text="$1"
+                fi
+        unset squeezed_text
+        squeezed_text=$(fmt --split-only --width=$width	<<< "$input_text")
+        fi
+}
+
+print_blockquoted() {
+        #  Print the remainder of $squeezed_text defined in blockquote()
+        squeezed_text=$(tail -n +2 <<< "$squeezed_text")
+        if [[ $squeezed_text ]]; then
+                #  Use the 'number lines' program, force a width of $padding
+                #  and turn actual numbers off. ;)
+                nl --number-width="$padding" --body-number="n" <<< "$squeezed_text"
+        fi
+}
+
+tr_chars() {
+        #  Revert special character entities
+        awk '
+                BEGIN {
+                        IGNORECASE = 1
+                        # Special characters to revert
+                        conv["&quot;"]  = "\""
+                        conv["&amp;"]   = "\\&"
+                        conv["&lt;"]    = "<"
+                        conv["&gt;"]    = ">"
+                        # Make these terminal friendly
+                        conv["&trade;"] = "(tm)"
+                        conv["&copy;"]  = "(c)"
+                        conv["&#xae;"]  = "(r)"
+                }
+                {
+                        for (i in conv)
+                                gsub(i, conv[i], $0); print
+                }
+        ' <<< "$1"
+}
+
+strip_tags() {
+        local text="${1//$'\n'/ }"  # Del \newlines
+        #  Strip xml tags, spaces and tabs off a line:
+        #  1 - Delete all opening <tags>
+        #  2 - Replace all closing </tags> with /newlines
+        #  3 - Delete leading spaces and tabs
+        #  4 - Squeeze multiple space characters into a single space
+        local text=$(
+                sed -r -e 's/<[a-z]*>//g' \
+                           -e 's/<\/[a-z]*>/\n/g' \
+                           -e 's/^[ \t]*//' \
+                           -e 's/[[:space:]]{2,}/ /g' <<< "$text")
+        echo "$text"
+}
+
+add_herd_email() {
+        #  Add default email address after herd, in case of no maintainer
+
+        awk '
+                BEGIN {
+                        IGNORECASE = 1
+
+                        conv["alsa"]             = "(alsa-bugs@gentoo.org)"
+                        conv["apache"]           = "(apache-bugs@gentoo.org)"
+                        conv["arm"]              = ""
+                        conv["comm-fax"]         = ""
+                        conv["cron"]             = "(cron-bugs@gentoo.org)"
+                        conv["dev-tools"]        = ""
+                        conv["freedesktop"]      = "(freedesktop-bugs@gentoo.org)"
+                        conv["gentopia"]         = "(utopia@gentoo.org)"
+                        conv["haskell"]          = ""
+                        conv["ia64-kernel"]      = ""
+                        conv["middle-east"]      = ""
+                        conv["ml"]               = "(lang-ml@gentoo.org)"
+                        conv["mysql"]            = "(mysql-bugs@gentoo.org)"
+                        conv["no-herd"]          = ""
+                        conv["pam"]              = "(pam-bugs@gentoo.org)"
+                        conv["php"]              = "(php-bugs@gentoo.org)"
+                        conv["postgresql"]       = "(pgsql-bugs@gentoo.org)"
+                        conv["qmail"]            = "(qmail-bugs@gentoo.org)"
+                        conv["s390"]             = ""
+                        conv["secure-tunneling"] = ""
+                        conv["sh"]               = ""
+                        conv["video"]            = "(media-video@gentoo.org)"
+                        conv["vserver"]          = "(vserver-devs@gentoo.org)"
+                } {
+                        for (i in conv) {
+                                if ($0 == i)
+                                { printf "%s\t%s\n", $0, conv[i]; next }
+                        }
+                        { printf "%s\t" "(%s@gentoo.org)\n", $0, $0 }
+                }
+        '
+}
+
+herd() {
+        #  Extract herd
+        local i="$1"
+        herd_string=$(grep herd "${metadata_location[$i]}")
+        herd_string=$(strip_tags "$herd_string" | add_herd_email)
+}
+
+maintainer() {
+        #  Extract maintainer's email address, name and description
+        local i="$1"
+        maintainer_lines=$(
+                sed '/<maintainer>/,/<\/maintainer>/!d' <"${metadata_location[$i]}"
+        )
+        maintainer_info=$(
+                egrep "email|name|description|maintainer" <<<"$maintainer_lines"
+        )
+        maintainer_info=$(strip_tags "$maintainer_info")
+}
+
+long_desc() {
+        #  Extract package description
+        local i="$1"
+        description=$(
+        sed '/<longdescription>/,/<\/longdescription>/!d' <${metadata_location[$i]}
+        )
+        description=$(strip_tags "$description")
+}
+
+useflags() {
+        #  Extracts human-readable USE flag information.
+        #  If the file conforms to "GLEP 56 -- USE flag descriptions in metadata"
+        #+ available here: http://www.gentoo.org/proj/en/glep/glep-0056.html
+        #+ then this should work well enough.
+
+        local i="$1"
+        #  Retrieve everything between <flag ...> and <flag>
+        useflag_lines=$(
+                sed -e '/<flag[^>]*>/,/<\/flag>/!d' < "${metadata_location[$i]}"
+        )
+        #  Translate tabs and newlines into spaces; squeeze repeated spaces
+        useflag_lines=$(tr -s '\n\t' ' ' <<< "$useflag_lines")
+
+        #  Strip out XML and format the information:
+        #  1   - Del double quotes
+        #  2   - Del leading spaces; change <flag name='...'> to [...]\n
+        #  3   - Replace </flag> with two \newlines
+        #  4   - Replace "restrict=..." with "(... only)"
+        #  5-8 - Quote package and category names
+        #  9   - Clean up any straggling XML flags
+        useflag_lines=$(
+                sed -r -e 's/"//g' \
+                        -e "s/ *<flag name='?([^'>]*)'?>/"${CY}"\1"${NO}"\n/g" \
+                        -e 's/<\/flag>/\n\n/g' \
+                        -e 's/restrict=([^\n]*)/'${NO}'\('${YL}'\1'${NO}' only\)/g' \
+                        -e 's/<pkg>/'${CY}'/g' \
+                        -e 's/<\/pkg>/'${NO}'/g' \
+                        -e 's/<pkg>/'${CY}'/g' \
+                        -e 's/<\/cat>/'${NO}'/g' \
+                        -e 's/<[^> ]*>//g' <<< "$useflag_lines"
+        )
+
+        #  Convert special chars
+        useflag_lines=$(tr_chars "$useflag_lines")
+}
+
+format_and_print() {
+        local i="$1"
+        herd $i
+        maintainer $i
+        long_desc $i
+        useflags $i
+
+        if [[ ! $herd_string ]]; then
+                echo "Herd:        None specified (but one should be!)" 1>&2
+        else
+                blockquote "$herd_string"
+                echo "Herd:        $(head -n 1 <<< "$squeezed_text")"
+                print_blockquoted
+        fi
+
+        if [[ ! $maintainer_info ]]; then
+                echo "Maintainer:  None specified"
+        else
+                blockquote "$maintainer_info"
+                echo "Maintainer:  $(head -n 1 <<< "$squeezed_text")"
+                print_blockquoted
+        fi
+
+        if [[ ! $description ]]; then
+                echo "Description: None specified"
+        else
+                blockquote "$description"
+                echo "Description: $(head -n 1 <<< "$squeezed_text")"
+                print_blockquoted
+        fi
+
+
+        if [[ ! $useflag_lines || $useflag_lines == *([$' \n']) ]]; then
+                echo "USE flags:   None specified"
+        else
+                blockquote "$useflag_lines"
+                echo "USE flags:   $(head -n 1 <<< "$squeezed_text")"
+                print_blockquoted
+        fi
+}
+
+##########
+# Check $called_options and call functions
+##########
+
+for (( i = 0 ; i < ${#metadata_location[@]} ; i++ )); do
+        if [[ $called_options = "" ]]; then
+                # We'll assume they want the default formatted information
+                [[ $i > 0 ]] && echo
+                echo -e "${GR} * ${NO}${BR}${package_dir[$i]#/*/*/}${NO}"
+                format_and_print $i
+        else
+                for option in $(echo "$called_options"); do
+                        if [[ ${#package_array[@]} > 1 ]]; then
+                                echo -e "${GR} * ${NO}${BR}${package_dir[$i]#/*/*/}${NO}"
+                        fi
+                        case "$option" in
+                        --directory )
+                                echo "${package_dir[$i]}"
+                                ;;
+                        --herd )
+                                herd $i
+                                echo "$herd_string"
+                                ;;
+                        --long-desc )
+                                long_desc $i
+                                fmt --split-only <<< "$description"
+                                ;;
+                        --maintainer )
+                                maintainer $i
+                                echo "$maintainer_info"
+                                ;;
+                        --raw-metadata )
+                                cat "${metadata_location[$i]}"
+                                ;;
+                        --use-flags )
+                                useflags $i
+                                fmt --split-only <<< "$useflag_lines"
+                                ;;
+                        esac
+                done
+        fi
+done
+
+exit 0
